@@ -3,6 +3,17 @@ from datetime import datetime; from typing import Dict, List, Tuple, Optional; f
 BASE_DIR = "/home/ninano990707/shark_system"; sys.path.append(BASE_DIR)
 from core_intel import MarketIntelligence; import core_trader; import core_logic; from core_constants import *
 
+# [P0-5c FIX] Explicit mapping from data-dict keys to get_latest_metrics() keys.
+# get_latest_metrics() returns: {oi_z, cvd_z, liq_l, liq_s}.
+# The old one-liner used k.replace('_z','') which produced 'l_liq'/'s_liq'
+# — keys that do NOT exist in i_m, so liq fallbacks silently returned 0.0.
+_STALE_FALLBACK_KEY = {
+    'oi_z':       'oi_z',
+    'l_liq_z':    'liq_l',
+    's_liq_z':    'liq_s',
+    # acc_z / rejection_z / abs_z are C++-only metrics — not in i_m; 0.0 fallback is correct.
+}
+
 class SharedMetric(ctypes.Structure):
     _pack_ = 1
     _fields_ = [("sequence", ctypes.c_uint64), ("price", ctypes.c_double), ("cvd_vel", ctypes.c_double), ("abs_score", ctypes.c_double), ("depth_ratio", ctypes.c_double), ("ob_vel", ctypes.c_double), ("rsi1", ctypes.c_double), ("rsi5", ctypes.c_double), ("rsi15", ctypes.c_double), ("vwap_z", ctypes.c_double), ("abs_z", ctypes.c_double), ("rejection_z", ctypes.c_double), ("eff_z", ctypes.c_double), ("vwap_raw", ctypes.c_double), ("cvd_total", ctypes.c_double), ("total_vol_raw", ctypes.c_double), ("oi_z", ctypes.c_double), ("l_liq_z", ctypes.c_double), ("s_liq_z", ctypes.c_double), ("liq_raw", ctypes.c_double), ("oi_raw", ctypes.c_double), ("acc_z", ctypes.c_double), ("score_short", ctypes.c_double), ("score_long", ctypes.c_double), ("update_ms", ctypes.c_uint64), ("update_time", ctypes.c_int64), ("signal_code", ctypes.c_int32), ("signal_side", ctypes.c_int32), ("friction_val", ctypes.c_double), ("symbol", ctypes.c_char * 16), ("high15m", ctypes.c_double), ("low15m", ctypes.c_double)]
@@ -80,7 +91,17 @@ class SovereignEngine:
                         if current_keys != new_keys:
                             logging.info("♻️ Config Mismatch Detected. Updating...")
                             cfg['symbols'] = {s: 100000.0 for s in top_100}
-                            with open(cfg_path, 'w') as f: json.dump(cfg, f, indent=4)
+                            # [P0-4 FIX] Atomic write via temp file + os.replace().
+                            # A direct open(..., 'w') write leaves a window where
+                            # the C++ engine may read a partially-written JSON file,
+                            # causing a parse failure and a missed reload.
+                            # os.replace() is POSIX-atomic (single syscall rename).
+                            tmp_path = cfg_path + ".tmp"
+                            with open(tmp_path, 'w') as f:
+                                json.dump(cfg, f, indent=4)
+                                f.flush()
+                                os.fsync(f.fileno())
+                            os.replace(tmp_path, cfg_path)
                             logging.info("💾 Config Saved. Triggering Rotation...")
                             subprocess.run(["pkill", "-SIGUSR1", "-f", "shark_engine_v37"], check=False)
                             logging.info("✅ Signal Sent.")
@@ -171,7 +192,8 @@ class SovereignEngine:
                             's_high': h15 if h15 > 0 else intel.struct_high_15m.get(sym, 0.0)
                         }
                         for k in ['oi_z', 'acc_z', 'rejection_z', 'abs_z', 'l_liq_z', 's_liq_z']:
-                            if (now_ts - ut > STALE_CHECK_TIMEOUT) or abs(data[k]) < 1e-6: data[k] = i_m.get(k.replace('_z', '') if 'liq' in k else k, 0.0)
+                            if (now_ts - ut > STALE_CHECK_TIMEOUT) or abs(data[k]) < 1e-6:
+                                data[k] = i_m.get(_STALE_FALLBACK_KEY.get(k, k), 0.0)
                         
                         # Internal call to update logic's persistent matrices (Pass 1)
                         is_active = sym in intel.active_position_symbols
@@ -236,12 +258,10 @@ class SovereignEngine:
                 await asyncio.sleep(max(0.001, SCANNER_SLEEP_TICK - (time.perf_counter() - start)))
 
             except Exception as loop_e:
+                # [P0-5a FIX] Removed duplicate except block (dead code — second
+                # handler was never reachable and shadowed the first).
                 logging.critical(f"💥 CRITICAL SCANNER LOOP ERROR: {loop_e}")
-                await asyncio.sleep(1.0)
-
-            except Exception as loop_e:
-                logging.critical(f"💥 CRITICAL SCANNER LOOP ERROR: {loop_e}")
-                await asyncio.sleep(1.0) # Prevent CPU spin loop on persistent error
+                await asyncio.sleep(1.0) # Prevent CPU spin on persistent error
 
 if __name__ == "__main__":
     import logging

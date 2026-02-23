@@ -82,12 +82,7 @@ class StrategyLogic:
         if m['rsi5'] == 0: return 0.0, "WARMUP", "NONE", "NONE", {}
         
         # [V61.0] Apply Regime Scaling
-        rm = StrategyLogic.regime_multipliers
-        scaled_th = StrategyLogic.dynamic_threshold * rm['score_th_mult']
-        scaled_vwap_l = GATE_VWAP_LONG * rm['vwap_gate_mult']
-        scaled_vwap_s = GATE_VWAP_SHORT * rm['vwap_gate_mult']
-        
-        # [V61.0] Apply Regime Scaling
+        # [P0-5b FIX] Removed duplicate block (copy-paste artifact).
         rm = StrategyLogic.regime_multipliers
         scaled_th = StrategyLogic.dynamic_threshold * rm['score_th_mult']
         scaled_vwap_l = GATE_VWAP_LONG * rm['vwap_gate_mult']
