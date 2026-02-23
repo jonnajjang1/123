@@ -357,6 +357,36 @@ class StrategyLogic:
         except: return 0.0, 0.0
 
     @staticmethod
+    def update_matrices_only(symbol: str, data: dict) -> Tuple[float, float]:
+        """
+        [P2-1] Lightweight Pass 1: updates NFE/OI matrices without full score computation.
+        Does NOT mutate persistence_history — prevents double-update of hist state
+        (old code zeroed rsi_delta/vwap_vel in Pass 2 because hist was already
+        updated by Pass 1 on the same data dict).
+        Returns (nfe_l, nfe_s).
+        """
+        def sv(v, d=0.0):
+            try: return float(v) if math.isfinite(float(v)) else d
+            except: return d
+        vel   = sv(data.get('cvd_vel', 0))
+        cvd_z = sv(data.get('cvd_z', 0))
+        vwap  = max(-5.0, min(5.0, sv(data.get('vwap_z', 0.0))))
+        oi_z  = sv(data.get('oi_z', 0.0))
+        nfe_l, nfe_s = 0.0, 0.0
+        if abs(vel) >= 0.05:
+            try:
+                eff_s   = math.tanh(max(0, cvd_z)) ** 2
+                eff_l   = math.tanh(abs(min(0, cvd_z))) ** 2
+                p_boost = math.exp(min(NFE_BOOST_CAP, abs(vwap) / NFE_BOOST_SCALING))
+                nfe_s   = (eff_s / (abs(vel) + 0.01)) * 100.0 * p_boost
+                nfe_l   = (eff_l / (abs(vel) + 0.01)) * 100.0 * p_boost
+            except: pass
+        StrategyLogic.nfe_matrix_long[symbol]  = nfe_l
+        StrategyLogic.nfe_matrix_short[symbol] = nfe_s
+        StrategyLogic.oi_matrix[symbol]        = max(0.0, oi_z)
+        return nfe_l, nfe_s
+
+    @staticmethod
     def _get_symbol_history(symbol: str) -> dict:
         if symbol not in StrategyLogic.persistence_history:
             StrategyLogic.persistence_history[symbol] = {

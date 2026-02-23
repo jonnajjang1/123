@@ -1,4 +1,4 @@
-import mmap; import struct; import time; import os; import json; import asyncio; import aiohttp; import logging; import fcntl; import signal; import sys; import re; import sqlite3; import subprocess; import ctypes; import importlib
+import mmap; import struct; import time; import os; import json; import asyncio; import aiohttp; import logging; import fcntl; import signal; import sys; import re; import sqlite3; import subprocess; import ctypes; import importlib; import heapq
 from datetime import datetime; from typing import Dict, List, Tuple, Optional; from collections import deque
 BASE_DIR = "/home/ninano990707/shark_system"; sys.path.append(BASE_DIR)
 from core_intel import MarketIntelligence; import core_trader; import core_logic; from core_constants import *
@@ -148,7 +148,7 @@ class SovereignEngine:
                 intel.active_position_symbols = set(self.trader.positions.keys())
                 
                 # --- [V60.7] ZERO-LAG RANKING SYSTEM (2-PASS SCAN) ---
-                m_data = {}; results = []; scan_queue = []
+                seen_syms = set(); results = []; scan_queue = []
                 loop_count = min(shm.symbol_count, 128)
                 stale_engine_count = 0
                 
@@ -200,19 +200,32 @@ class SovereignEngine:
                             if (now_ts - ut > STALE_CHECK_TIMEOUT) or abs(data[k]) < 1e-6:
                                 data[k] = i_m.get(_STALE_FALLBACK_KEY.get(k, k), 0.0)
                         
-                        # Internal call to update logic's persistent matrices (Pass 1)
+                        # [P2-1] Lightweight matrix update replaces full calculate_hybrid_score(rank_maps=None).
+                        # Fix: old code double-mutated persistence_history (hist state updated in both Pass 1
+                        # and Pass 2 with same data → rsi_delta/vwap_vel zeroed in Pass 2).
                         is_active = sym in intel.active_position_symbols
-                        score, sig, mode, side, det = logic.calculate_hybrid_score(sym, data, intel, None, is_active_position=is_active)
-                        
-                        m_data[sym] = {'cp': p, 'vwap_z': vz, 'rsi5': r5_calib, 'rsi15': r15_calib, 'abs_z': data['abs_z'], 'acc_z': data['acc_z'], 'eff_z': ez, 'oi_z': data['oi_z'], 'cvd_z': data.get('cvd_z', 0.0), 'absorption_power': det.get('absorption', 0.0), 'fric': det.get('fric', 0.0), 'cvd_vel': data.get('cvd_vel', 0.0), 'l_liq_z': data.get('l_liq_z', 0.0), 's_liq_z': data.get('s_liq_z', 0.0), 'score_short': score if side == 'SHORT' else 0.0, 'score_long': score if side == 'LONG' else 0.0, 'th': det.get('th', 350.0)}
-                        scan_queue.append((sym, data, is_active))
+                        logic.update_matrices_only(sym, data)
+
+                        # Inline absorption_power: fric and ez already in data dict — no full score call needed
+                        eff_discount = max(0.3, 1.0 - max(0.0, ez) * ABSORPTION_EFF_DISCOUNT)
+                        absorption_power = fric * eff_discount
+
+                        # [P2-2] In-place update: avoids new top-level dict allocation + GC pressure each tick
+                        self.market_data_cache[sym] = {
+                            'cp': p, 'vwap_z': vz, 'rsi5': r5_calib, 'rsi15': r15_calib,
+                            'abs_z': data['abs_z'], 'acc_z': data['acc_z'], 'eff_z': ez,
+                            'oi_z': data['oi_z'], 'cvd_z': data['cvd_z'],
+                            'absorption_power': absorption_power, 'fric': fric,
+                            'cvd_vel': cv, 'l_liq_z': data['l_liq_z'], 's_liq_z': data['s_liq_z'],
+                            'score_short': 0.0, 'score_long': 0.0,  # updated in-place after Pass 2
+                            'th': logic.dynamic_threshold * logic.regime_multipliers['score_th_mult']
+                        }
+                        seen_syms.add(sym)
+                        scan_queue.append((sym, data, is_active, m))  # carry m ref for Pass 2 SHM write
 
                         try:
                             m.oi_z, m.oi_raw, m.rsi5, m.rsi15 = data['oi_z'], data['oi_raw'], r5_calib, r15_calib
-                            raw_score = float(det.get('s_score', score))
-                            if side == 'SHORT': m.score_short, m.score_long = raw_score, 0.0
-                            elif side == 'LONG': m.score_long, m.score_short = raw_score, 0.0
-                            else: m.score_short = m.score_long = 0.0
+                            m.score_short = m.score_long = 0.0  # final scores written in Pass 2 via m_ref
                         except: pass
 
                     except Exception as sym_e:
@@ -220,19 +233,38 @@ class SovereignEngine:
                         continue
 
                 # RE-RANK & UPDATE CONTEXT (Sync Point)
-                logic.update_market_context(m_data); self.market_data_cache = m_data; intel.update_oi_snapshot(m_data)
-                
+                # [P2-2] Prune symbols not seen this tick (removed from SHM since last scan)
+                for _s in [k for k in self.market_data_cache if k not in seen_syms]:
+                    del self.market_data_cache[_s]
+                logic.update_market_context(self.market_data_cache)
+                intel.update_oi_snapshot(self.market_data_cache)
+
+                # [P2-3] heapq.nlargest: O(n log k) vs sorted O(n log n) for top-k rank extraction
                 rank_maps = {
-                    'l_rank': {s: i+1 for i, (s, v) in enumerate(sorted(logic.nfe_matrix_long.items(), key=lambda x: x[1], reverse=True)[:RANK_LIMIT_NFE_POOL])},
-                    's_rank': {s: i+1 for i, (s, v) in enumerate(sorted(logic.nfe_matrix_short.items(), key=lambda x: x[1], reverse=True)[:RANK_LIMIT_NFE_POOL])},
-                    'oi_rank': {s: i+1 for i, (s, v) in enumerate(sorted(logic.oi_matrix.items(), key=lambda x: x[1], reverse=True)[:RANK_LIMIT_OI_POOL])}
+                    'l_rank':  {s: r+1 for r, (s, _) in enumerate(heapq.nlargest(RANK_LIMIT_NFE_POOL, logic.nfe_matrix_long.items(),  key=lambda x: x[1]))},
+                    's_rank':  {s: r+1 for r, (s, _) in enumerate(heapq.nlargest(RANK_LIMIT_NFE_POOL, logic.nfe_matrix_short.items(), key=lambda x: x[1]))},
+                    'oi_rank': {s: r+1 for r, (s, _) in enumerate(heapq.nlargest(RANK_LIMIT_OI_POOL,  logic.oi_matrix.items(),         key=lambda x: x[1]))}
                 }
 
                 # PASS 2: FINAL DECISIONS WITH FRESH RANKINGS
-                for sym, data, is_active in scan_queue:
+                for sym, data, is_active, m_ref in scan_queue:
                     score, sig, mode, side, det = logic.calculate_hybrid_score(sym, data, intel, rank_maps, is_active_position=is_active)
                     orig_score = det.get('s_score', score)
-                    
+
+                    # [P2-2] Update cache with final scores in-place
+                    if sym in self.market_data_cache:
+                        _c = self.market_data_cache[sym]
+                        _c['score_short'] = score if side == 'SHORT' else 0.0
+                        _c['score_long']  = score if side == 'LONG'  else 0.0
+                        _c['th'] = det.get('th', 350.0)
+                    # [P2-1] Write final scores to SHM via m_ref (replaces stale preliminary Pass 1 write)
+                    try:
+                        _raw = float(det.get('s_score', score))
+                        if side == 'SHORT':  m_ref.score_short, m_ref.score_long = _raw, 0.0
+                        elif side == 'LONG': m_ref.score_long,  m_ref.score_short = _raw, 0.0
+                        else:                m_ref.score_short = m_ref.score_long = 0.0
+                    except: pass
+
                     if sig == "SNIPER":
                         if sym not in intel.rsi_state:
                             await intel.ensure_rsi_ready(self.session, sym)
@@ -251,14 +283,14 @@ class SovereignEngine:
                     sys.exit(1)
 
                 if now_ts - self.last_logic_gc > LOGIC_GC_INTERVAL:
-                    active_syms = set(m_data.keys()) | self.trader.positions.keys()
+                    active_syms = set(self.market_data_cache.keys()) | self.trader.positions.keys()
                     logic.run_memory_gc(active_syms)
                     self.last_logic_gc = now_ts
 
                 if results:
                     results.sort(key=lambda x: x[1], reverse=True)
                     for sym, score, side, mode, p, det in results[:3]: 
-                        asyncio.create_task(self.trader.open_position(sym, side, score, 1, mode, p, intel, det, m_data))
+                        asyncio.create_task(self.trader.open_position(sym, side, score, 1, mode, p, intel, det, self.market_data_cache))
                 
                 await asyncio.sleep(max(0.001, SCANNER_SLEEP_TICK - (time.perf_counter() - start)))
 
