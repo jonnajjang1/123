@@ -41,17 +41,21 @@ class StrategyLogic:
     def update_market_context(market_data: dict):
         if not market_data: return
         
-        # 1. Volatility Axis (Avg Abs VWAP-Z)
-        abs_zs = [abs(d['vwap_z']) for d in market_data.values() if 'vwap_z' in d]
-        avg_abs_z = sum(abs_zs) / len(abs_zs) if abs_zs else 1.0
+        # [P3-1] Single-pass: compute avg_abs_z AND directional consensus simultaneously.
+        # Old code made 2 separate list/generator iterations over market_data.values()
+        # plus a sum() pass over abs_zs — 3 passes total → 1 pass now.
+        abs_z_sum = 0.0; n_valid = 0; positive = 0
+        for d in market_data.values():
+            vz = d.get('vwap_z')
+            if vz is None: continue
+            abs_z_sum += abs(vz)
+            n_valid += 1
+            if vz > 0.5: positive += 1
+        avg_abs_z = abs_z_sum / n_valid if n_valid > 0 else 1.0
         StrategyLogic.global_volatility = avg_abs_z
-        
-        # 2. Directional Consensus Axis (V61.0 Innovation)
+
         total = len(market_data)
-        if total > 0:
-            positive = sum(1 for d in market_data.values() if d.get('vwap_z', 0) > 0.5)
-            consensus = abs(positive / total - 0.5) * 2.0 # 0 to 1, 1=trending, 0=ranging
-        else: consensus = 0.5
+        consensus = abs(positive / total - 0.5) * 2.0 if total > 0 else 0.5  # 0=ranging, 1=trending
         
         # 3. Regime Classification
         is_high_vol = avg_abs_z > 1.2
@@ -82,12 +86,7 @@ class StrategyLogic:
         if m['rsi5'] == 0: return 0.0, "WARMUP", "NONE", "NONE", {}
         
         # [V61.0] Apply Regime Scaling
-        rm = StrategyLogic.regime_multipliers
-        scaled_th = StrategyLogic.dynamic_threshold * rm['score_th_mult']
-        scaled_vwap_l = GATE_VWAP_LONG * rm['vwap_gate_mult']
-        scaled_vwap_s = GATE_VWAP_SHORT * rm['vwap_gate_mult']
-        
-        # [V61.0] Apply Regime Scaling
+        # [P0-5b FIX] Removed duplicate block (copy-paste artifact).
         rm = StrategyLogic.regime_multipliers
         scaled_th = StrategyLogic.dynamic_threshold * rm['score_th_mult']
         scaled_vwap_l = GATE_VWAP_LONG * rm['vwap_gate_mult']
@@ -271,7 +270,29 @@ class StrategyLogic:
         def sv(v, d=0.0):
             try: return float(v) if math.isfinite(float(v)) else d
             except: return d
-        return {'dr': sv(data.get('depth_ratio', 0)), 'rsi1': sv(data.get('rsi1', 50)), 'rsi5': sv(data.get('rsi5', 50)), 'rsi15': sv(data.get('rsi15', 50)), 'abs_sc': sv(data.get('abs_score', 0)), 'abs': sv(data.get('abs_z', 0)), 'vel': sv(data.get('cvd_vel', 0)), 'cvd_z': sv(data.get('cvd_z', 0)), 'acc_z': sv(data.get('acc_z', 0)), 'vwap': max(-5.0, min(5.0, sv(data.get('vwap_z', 0.0)))), 'eff': sv(data.get('eff_z', 0)), 'cp': sv(data.get('cp', 0)), 'oi_z': sv(data.get('oi_z', 0.0)), 'oi_raw': sv(data.get('oi_raw', 0.0)), 'fric': sv(data.get('fric', 0.0)), 's_low': sv(data.get('s_low', 0.0)), 's_high': sv(data.get('s_high', 0.0)), 'l_liq_z': sv(data.get('l_liq_z', 0.0)), 's_liq_z': sv(data.get('s_liq_z', 0.0)), 'ob_vel': sv(data.get('ob_vel', 0.0))}
+        # [P3-3] Readability: split the one-liner return into aligned multi-line dict.
+        return {
+            'dr':      sv(data.get('depth_ratio', 0)),
+            'rsi1':    sv(data.get('rsi1', 50)),
+            'rsi5':    sv(data.get('rsi5', 50)),
+            'rsi15':   sv(data.get('rsi15', 50)),
+            'abs_sc':  sv(data.get('abs_score', 0)),
+            'abs':     sv(data.get('abs_z', 0)),
+            'vel':     sv(data.get('cvd_vel', 0)),
+            'cvd_z':   sv(data.get('cvd_z', 0)),
+            'acc_z':   sv(data.get('acc_z', 0)),
+            'vwap':    max(-5.0, min(5.0, sv(data.get('vwap_z', 0.0)))),
+            'eff':     sv(data.get('eff_z', 0)),
+            'cp':      sv(data.get('cp', 0)),
+            'oi_z':    sv(data.get('oi_z', 0.0)),
+            'oi_raw':  sv(data.get('oi_raw', 0.0)),
+            'fric':    sv(data.get('fric', 0.0)),
+            's_low':   sv(data.get('s_low', 0.0)),
+            's_high':  sv(data.get('s_high', 0.0)),
+            'l_liq_z': sv(data.get('l_liq_z', 0.0)),
+            's_liq_z': sv(data.get('s_liq_z', 0.0)),
+            'ob_vel':  sv(data.get('ob_vel', 0.0)),
+        }
 
     @staticmethod
     def _check_parabolic_state(m: dict) -> Tuple[bool, bool]:
@@ -362,11 +383,44 @@ class StrategyLogic:
         except: return 0.0, 0.0
 
     @staticmethod
+    def update_matrices_only(symbol: str, data: dict) -> Tuple[float, float]:
+        """
+        [P2-1] Lightweight Pass 1: updates NFE/OI matrices without full score computation.
+        Does NOT mutate persistence_history — prevents double-update of hist state
+        (old code zeroed rsi_delta/vwap_vel in Pass 2 because hist was already
+        updated by Pass 1 on the same data dict).
+        Returns (nfe_l, nfe_s).
+        """
+        def sv(v, d=0.0):
+            try: return float(v) if math.isfinite(float(v)) else d
+            except: return d
+        vel   = sv(data.get('cvd_vel', 0))
+        cvd_z = sv(data.get('cvd_z', 0))
+        vwap  = max(-5.0, min(5.0, sv(data.get('vwap_z', 0.0))))
+        oi_z  = sv(data.get('oi_z', 0.0))
+        nfe_l, nfe_s = 0.0, 0.0
+        if abs(vel) >= 0.05:
+            try:
+                eff_s   = math.tanh(max(0, cvd_z)) ** 2
+                eff_l   = math.tanh(abs(min(0, cvd_z))) ** 2
+                p_boost = math.exp(min(NFE_BOOST_CAP, abs(vwap) / NFE_BOOST_SCALING))
+                nfe_s   = (eff_s / (abs(vel) + 0.01)) * 100.0 * p_boost
+                nfe_l   = (eff_l / (abs(vel) + 0.01)) * 100.0 * p_boost
+            except: pass
+        StrategyLogic.nfe_matrix_long[symbol]  = nfe_l
+        StrategyLogic.nfe_matrix_short[symbol] = nfe_s
+        StrategyLogic.oi_matrix[symbol]        = max(0.0, oi_z)
+        return nfe_l, nfe_s
+
+    @staticmethod
     def _get_symbol_history(symbol: str) -> dict:
         if symbol not in StrategyLogic.persistence_history:
             StrategyLogic.persistence_history[symbol] = {
-                'SHORT': deque([0.0]*20, maxlen=20), 'LONG': deque([0.0]*20, maxlen=20), 
-                'abs_streak': deque(maxlen=5), 'wall_window': deque(maxlen=3), 'oi_snapshots': deque(maxlen=12), 
+                'SHORT': deque([0.0]*20, maxlen=20), 'LONG': deque([0.0]*20, maxlen=20),
+                # [P1-1] Running sums for O(1) averaging in _apply_persistence.
+                # Initial value is 0.0 because the deques start filled with 0.0.
+                'sum_s': 0.0, 'sum_l': 0.0,
+                'abs_streak': deque(maxlen=5), 'wall_window': deque(maxlen=3), 'oi_snapshots': deque(maxlen=12),
                 'last_rsi': 50.0, 'last_vwap_z': 0.0, 'last_price': 0.0, 'last_oi': 0.0,
                 'last_abs': 0.0, 'last_vwap_vel': 0.0
             }
@@ -374,8 +428,17 @@ class StrategyLogic:
 
     @staticmethod
     def _apply_persistence(hist: dict, sc_s: float, sc_l: float) -> Tuple[float, float]:
-        hist['SHORT'].append(sc_s); hist['LONG'].append(sc_l)
-        avg_s, avg_l = sum(hist['SHORT']) / 20, sum(hist['LONG']) / 20
+        # [P1-1] O(1) running sum: subtract the value about to be evicted (index 0),
+        # then append. Both deques are always full (init: [0.0]*20, maxlen=20),
+        # so index[0] is always the next eviction candidate.
+        hist['sum_s'] -= hist['SHORT'][0]
+        hist['sum_l'] -= hist['LONG'][0]
+        hist['SHORT'].append(sc_s)
+        hist['LONG'].append(sc_l)
+        hist['sum_s'] += sc_s
+        hist['sum_l'] += sc_l
+        avg_s = hist['sum_s'] / 20
+        avg_l = hist['sum_l'] / 20
         return sc_s + (sc_s - avg_s) * 0.15, sc_l + (sc_l - avg_l) * 0.15
 
     @staticmethod
@@ -391,7 +454,12 @@ class StrategyLogic:
 
     @staticmethod
     def run_memory_gc(active_symbols: set):
-        StrategyLogic.persistence_history = {s: v for s, v in StrategyLogic.persistence_history.items() if s in active_symbols}
-        StrategyLogic.nfe_matrix_long = {s: v for s, v in StrategyLogic.nfe_matrix_long.items() if s in active_symbols}
-        StrategyLogic.nfe_matrix_short = {s: v for s, v in StrategyLogic.nfe_matrix_short.items() if s in active_symbols}
-        StrategyLogic.oi_matrix = {s: v for s, v in StrategyLogic.oi_matrix.items() if s in active_symbols}
+        # [P3-2] O(k) in-place deletion vs O(n) full dict rebuild.
+        # dict.keys() - set returns only stale symbols (k << n in steady state),
+        # avoiding 4 new dict allocations and copies of all ~100 live entries.
+        stale = StrategyLogic.persistence_history.keys() - active_symbols
+        for s in stale:
+            StrategyLogic.persistence_history.pop(s, None)
+            StrategyLogic.nfe_matrix_long.pop(s, None)
+            StrategyLogic.nfe_matrix_short.pop(s, None)
+            StrategyLogic.oi_matrix.pop(s, None)

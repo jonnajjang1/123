@@ -50,6 +50,7 @@ const size_t SHM_SIZE_BYTES = sizeof(SharedMemoryBlock);
 SharedMemoryBlock* shm_ptr = nullptr;
 string g_shm_path = "/dev/shm/shark_shm_v60";
 atomic<bool> g_reload_config{false};
+atomic<bool> g_engine_running{true}; // [P0-2 FIX] single long-lived flag for pulse thread
 
 // Configurable Constants (Defaults)
 double g_score_threshold = 245.0;
@@ -110,13 +111,22 @@ string http_get_sync(const string& host, const string& target) {
 
 template<typename F>
 void atomic_update(SharedMetric& target, F func) {
+    // [P0-3 FIX] Seqlock write protocol:
+    // 1. Odd sequence signals "write in progress" — readers must retry.
     uint64_t s1 = target.sequence;
     target.sequence = s1 + 1;
-    std::atomic_thread_fence(std::memory_order_release); // [SURGERY] Memory Barrier: Release
+    // 2. Release fence: ensures s1+1 store is globally visible BEFORE any
+    //    data field writes in func(). Prevents readers from seeing new data
+    //    while sequence still appears even.
+    std::atomic_thread_fence(std::memory_order_release);
     func(target);
     target.update_ms = chrono::duration_cast<chrono::milliseconds>(chrono::system_clock::now().time_since_epoch()).count();
     target.update_time = time(nullptr);
-    std::atomic_thread_fence(std::memory_order_release); // [SURGERY] Ensure all fields are written
+    // 3. seq_cst fence: full memory barrier after ALL field writes.
+    //    Upgraded from release to seq_cst to guarantee ordering on relaxed
+    //    memory model architectures (e.g. ARM). Ensures every field written
+    //    above is committed before the even sequence becomes visible.
+    std::atomic_thread_fence(std::memory_order_seq_cst);
     target.sequence = s1 + 2;
 }
 
@@ -443,7 +453,16 @@ int main(int argc, char** argv) {
     unordered_map<string, shared_ptr<SymbolEngine>> active_engines;
 
     // Force initial load
-    g_reload_config = true; 
+    g_reload_config = true;
+
+    // [P0-2 FIX] Single long-lived pulse thread created ONCE here.
+    // Previously created inside the reload loop and detached on every config
+    // reload, causing unbounded thread accumulation (thread exhaustion leak).
+    thread pulse_thread([]() {
+        while (g_engine_running.load()) {
+            this_thread::sleep_for(chrono::seconds(10));
+        }
+    });
 
     while (true) {
         printf("DEBUG: Configuration reload triggered. Mode: HOT-SWAP\n");
@@ -500,14 +519,6 @@ int main(int argc, char** argv) {
             shm_ptr->symbol_count = idx;
         }
         
-        // [V52] Heartbeat Monitor
-        thread pulse_thread([&]() {
-            while(!g_reload_config) {
-                this_thread::sleep_for(chrono::seconds(10));
-            }
-        });
-        pulse_thread.detach();
-
         // Identify fresh engines for seeding
         vector<shared_ptr<SymbolEngine>> new_seeds;
         for (auto& pair : active_engines) {
@@ -540,5 +551,8 @@ int main(int argc, char** argv) {
         ioc.run();
         if (!g_reload_config) break;
     }
+    // [P0-2 FIX] Signal pulse thread to exit and join cleanly
+    g_engine_running = false;
+    pulse_thread.join();
     return 0;
 }
