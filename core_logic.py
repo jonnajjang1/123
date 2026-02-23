@@ -41,17 +41,21 @@ class StrategyLogic:
     def update_market_context(market_data: dict):
         if not market_data: return
         
-        # 1. Volatility Axis (Avg Abs VWAP-Z)
-        abs_zs = [abs(d['vwap_z']) for d in market_data.values() if 'vwap_z' in d]
-        avg_abs_z = sum(abs_zs) / len(abs_zs) if abs_zs else 1.0
+        # [P3-1] Single-pass: compute avg_abs_z AND directional consensus simultaneously.
+        # Old code made 2 separate list/generator iterations over market_data.values()
+        # plus a sum() pass over abs_zs — 3 passes total → 1 pass now.
+        abs_z_sum = 0.0; n_valid = 0; positive = 0
+        for d in market_data.values():
+            vz = d.get('vwap_z')
+            if vz is None: continue
+            abs_z_sum += abs(vz)
+            n_valid += 1
+            if vz > 0.5: positive += 1
+        avg_abs_z = abs_z_sum / n_valid if n_valid > 0 else 1.0
         StrategyLogic.global_volatility = avg_abs_z
-        
-        # 2. Directional Consensus Axis (V61.0 Innovation)
+
         total = len(market_data)
-        if total > 0:
-            positive = sum(1 for d in market_data.values() if d.get('vwap_z', 0) > 0.5)
-            consensus = abs(positive / total - 0.5) * 2.0 # 0 to 1, 1=trending, 0=ranging
-        else: consensus = 0.5
+        consensus = abs(positive / total - 0.5) * 2.0 if total > 0 else 0.5  # 0=ranging, 1=trending
         
         # 3. Regime Classification
         is_high_vol = avg_abs_z > 1.2
@@ -266,7 +270,29 @@ class StrategyLogic:
         def sv(v, d=0.0):
             try: return float(v) if math.isfinite(float(v)) else d
             except: return d
-        return {'dr': sv(data.get('depth_ratio', 0)), 'rsi1': sv(data.get('rsi1', 50)), 'rsi5': sv(data.get('rsi5', 50)), 'rsi15': sv(data.get('rsi15', 50)), 'abs_sc': sv(data.get('abs_score', 0)), 'abs': sv(data.get('abs_z', 0)), 'vel': sv(data.get('cvd_vel', 0)), 'cvd_z': sv(data.get('cvd_z', 0)), 'acc_z': sv(data.get('acc_z', 0)), 'vwap': max(-5.0, min(5.0, sv(data.get('vwap_z', 0.0)))), 'eff': sv(data.get('eff_z', 0)), 'cp': sv(data.get('cp', 0)), 'oi_z': sv(data.get('oi_z', 0.0)), 'oi_raw': sv(data.get('oi_raw', 0.0)), 'fric': sv(data.get('fric', 0.0)), 's_low': sv(data.get('s_low', 0.0)), 's_high': sv(data.get('s_high', 0.0)), 'l_liq_z': sv(data.get('l_liq_z', 0.0)), 's_liq_z': sv(data.get('s_liq_z', 0.0)), 'ob_vel': sv(data.get('ob_vel', 0.0))}
+        # [P3-3] Readability: split the one-liner return into aligned multi-line dict.
+        return {
+            'dr':      sv(data.get('depth_ratio', 0)),
+            'rsi1':    sv(data.get('rsi1', 50)),
+            'rsi5':    sv(data.get('rsi5', 50)),
+            'rsi15':   sv(data.get('rsi15', 50)),
+            'abs_sc':  sv(data.get('abs_score', 0)),
+            'abs':     sv(data.get('abs_z', 0)),
+            'vel':     sv(data.get('cvd_vel', 0)),
+            'cvd_z':   sv(data.get('cvd_z', 0)),
+            'acc_z':   sv(data.get('acc_z', 0)),
+            'vwap':    max(-5.0, min(5.0, sv(data.get('vwap_z', 0.0)))),
+            'eff':     sv(data.get('eff_z', 0)),
+            'cp':      sv(data.get('cp', 0)),
+            'oi_z':    sv(data.get('oi_z', 0.0)),
+            'oi_raw':  sv(data.get('oi_raw', 0.0)),
+            'fric':    sv(data.get('fric', 0.0)),
+            's_low':   sv(data.get('s_low', 0.0)),
+            's_high':  sv(data.get('s_high', 0.0)),
+            'l_liq_z': sv(data.get('l_liq_z', 0.0)),
+            's_liq_z': sv(data.get('s_liq_z', 0.0)),
+            'ob_vel':  sv(data.get('ob_vel', 0.0)),
+        }
 
     @staticmethod
     def _check_parabolic_state(m: dict) -> Tuple[bool, bool]:
@@ -428,7 +454,12 @@ class StrategyLogic:
 
     @staticmethod
     def run_memory_gc(active_symbols: set):
-        StrategyLogic.persistence_history = {s: v for s, v in StrategyLogic.persistence_history.items() if s in active_symbols}
-        StrategyLogic.nfe_matrix_long = {s: v for s, v in StrategyLogic.nfe_matrix_long.items() if s in active_symbols}
-        StrategyLogic.nfe_matrix_short = {s: v for s, v in StrategyLogic.nfe_matrix_short.items() if s in active_symbols}
-        StrategyLogic.oi_matrix = {s: v for s, v in StrategyLogic.oi_matrix.items() if s in active_symbols}
+        # [P3-2] O(k) in-place deletion vs O(n) full dict rebuild.
+        # dict.keys() - set returns only stale symbols (k << n in steady state),
+        # avoiding 4 new dict allocations and copies of all ~100 live entries.
+        stale = StrategyLogic.persistence_history.keys() - active_symbols
+        for s in stale:
+            StrategyLogic.persistence_history.pop(s, None)
+            StrategyLogic.nfe_matrix_long.pop(s, None)
+            StrategyLogic.nfe_matrix_short.pop(s, None)
+            StrategyLogic.oi_matrix.pop(s, None)
