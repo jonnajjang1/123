@@ -167,8 +167,13 @@ class SovereignEngine:
                                 sym_post = m.symbol.decode('ascii', errors='ignore').strip('\x00')
                                 if m.sequence == s1 and sym_pre == sym_post:
                                     sym = sym_pre; success = True; break
+                            # [P1-4] Removed await asyncio.sleep(0) from retry body.
+                            # Yielding to the event loop on every SHM contention attempt
+                            # (up to 3 retries × 128 symbols = 384 yields per scan tick)
+                            # floods the scheduler. C++ writes complete in microseconds,
+                            # so an immediate retry succeeds in practice. The scanner
+                            # yields naturally via the final await asyncio.sleep() each tick.
                             if retry > 0: stats['shm_retries'] += 1
-                            await asyncio.sleep(0)
                         
                         if not success or p <= 0: continue
                         if sym in self.market_data_cache:

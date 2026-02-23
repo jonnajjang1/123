@@ -360,8 +360,11 @@ class StrategyLogic:
     def _get_symbol_history(symbol: str) -> dict:
         if symbol not in StrategyLogic.persistence_history:
             StrategyLogic.persistence_history[symbol] = {
-                'SHORT': deque([0.0]*20, maxlen=20), 'LONG': deque([0.0]*20, maxlen=20), 
-                'abs_streak': deque(maxlen=5), 'wall_window': deque(maxlen=3), 'oi_snapshots': deque(maxlen=12), 
+                'SHORT': deque([0.0]*20, maxlen=20), 'LONG': deque([0.0]*20, maxlen=20),
+                # [P1-1] Running sums for O(1) averaging in _apply_persistence.
+                # Initial value is 0.0 because the deques start filled with 0.0.
+                'sum_s': 0.0, 'sum_l': 0.0,
+                'abs_streak': deque(maxlen=5), 'wall_window': deque(maxlen=3), 'oi_snapshots': deque(maxlen=12),
                 'last_rsi': 50.0, 'last_vwap_z': 0.0, 'last_price': 0.0, 'last_oi': 0.0,
                 'last_abs': 0.0, 'last_vwap_vel': 0.0
             }
@@ -369,8 +372,17 @@ class StrategyLogic:
 
     @staticmethod
     def _apply_persistence(hist: dict, sc_s: float, sc_l: float) -> Tuple[float, float]:
-        hist['SHORT'].append(sc_s); hist['LONG'].append(sc_l)
-        avg_s, avg_l = sum(hist['SHORT']) / 20, sum(hist['LONG']) / 20
+        # [P1-1] O(1) running sum: subtract the value about to be evicted (index 0),
+        # then append. Both deques are always full (init: [0.0]*20, maxlen=20),
+        # so index[0] is always the next eviction candidate.
+        hist['sum_s'] -= hist['SHORT'][0]
+        hist['sum_l'] -= hist['LONG'][0]
+        hist['SHORT'].append(sc_s)
+        hist['LONG'].append(sc_l)
+        hist['sum_s'] += sc_s
+        hist['sum_l'] += sc_l
+        avg_s = hist['sum_s'] / 20
+        avg_l = hist['sum_l'] / 20
         return sc_s + (sc_s - avg_s) * 0.15, sc_l + (sc_l - avg_l) * 0.15
 
     @staticmethod
