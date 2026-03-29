@@ -224,14 +224,14 @@ class SharkTrader:
     async def open_position(self, symbol, side, score, rank, mode, price, intel, details, market_data=None):
         async with self.lock:
             if not self._can_open(symbol): return False
-            
+
             # --- IRONSHIELD: REAL GLOBAL PNL INTEGRITY CHECK (V58.0 Patch) ---
             current_total_pnl = 0.0
             if market_data:
                 for s, p in self.positions.items():
                     curr_p = market_data.get(s, {}).get('cp', p['entry']) # Fallback to entry if not in cache
                     current_total_pnl += self._calculate_net_pnl(p, curr_p)
-            
+
             if self.wallet['balance'] * (1 + current_total_pnl) < self.wallet['balance'] * (1 + self.global_pnl_stop_limit):
                 logging.warning(f"⚠️ [IronShield] Entry Blocked: Global PnL Limit Hit ({current_total_pnl:.2%})")
                 return False
@@ -242,9 +242,13 @@ class SharkTrader:
             if qty <= 0: return False
             pos = {'entry': price, 'type': side, 'qty': qty, 'entry_margin': margin, 'lev': DEFAULT_LEVERAGE, 'start_time': time.time(), 'details': {**details, "max_price": price}}
             self.positions[symbol] = pos
-            await self._execute_db_task(self._db_add_pos, symbol, price, side, qty, margin, DEFAULT_LEVERAGE, pos['details'])
-            self._notify_open(symbol, side, price, score, mode, details)
-            return True
+            # [P0-1 FIX] DB write and notification moved outside lock.
+            # Holding a lock over an await yields control to the event loop,
+            # which can cause other coroutines to block on lock acquisition.
+
+        await self._execute_db_task(self._db_add_pos, symbol, price, side, qty, margin, DEFAULT_LEVERAGE, pos['details'])
+        self._notify_open(symbol, side, price, score, mode, details)
+        return True
 
     def _db_add_pos(self, conn, sym, p, s, q, m, lev, det):
         conn.execute("INSERT OR REPLACE INTO active_positions VALUES (?,?,?,?,?,?,?,?,?)", (sym, p, s, q, m, -0.01, time.time(), json.dumps(det), lev))

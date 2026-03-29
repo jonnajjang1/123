@@ -135,35 +135,34 @@ class MarketIntelligence:
         return self._get_rsi_from_state(curr_au, curr_ad)
 
     def _update_cvd_stats(self, sym, val):
+        # [P1-2] O(1) rolling sum / sum-of-squares — mirrors _update_oi_stats.
+        # The previous implementation used Welford's algorithm for the warmup
+        # phase but fell back to an O(2n) full list recompute once the window
+        # reached capacity (100 samples), which was called on every trade tick.
+        # cvd_sum and cvd_sum_sq are already declared in __init__ and cleaned
+        # by _run_gc, so no new fields are introduced.
         if sym not in self.cvd_history:
-            self.cvd_history[sym] = deque(maxlen=100)
-            self.cvd_state[sym] = {'n': 0, 'mean': 0.0, 'M2': 0.0}
-        
-        state = self.cvd_state[sym]
-        # Robust Welford's Algorithm (O(1)) for incremental mean and variance
-        state['n'] += 1
-        delta = val - state['mean']
-        state['mean'] += delta / state['n']
-        delta2 = val - state['mean']
-        state['M2'] += delta * delta2
-        
-        # Manage windowing effects by resetting slightly to maintain stability
-        # or by using the stored history for precise windowed Z-score
+            self.cvd_history[sym]  = deque(maxlen=100)
+            self.cvd_sum[sym]      = 0.0
+            self.cvd_sum_sq[sym]   = 0.0
+
         if len(self.cvd_history[sym]) == 100:
             old_val = self.cvd_history[sym][0]
-            # Precise Windowed Stats would require O(N) or more complex Welford
-            # Given N=100 is small, but called often, we use history for precise std
-            self.cvd_history[sym].append(val)
-            vals = list(self.cvd_history[sym])
-            mean = sum(vals) / 100
-            std = (sum((x - mean) ** 2 for x in vals) / 100) ** 0.5
+            self.cvd_sum[sym]    -= old_val
+            self.cvd_sum_sq[sym] -= old_val * old_val
+
+        self.cvd_history[sym].append(val)
+        self.cvd_sum[sym]    += val
+        self.cvd_sum_sq[sym] += val * val
+
+        h_len = len(self.cvd_history[sym])
+        if h_len >= 10:
+            mean = self.cvd_sum[sym] / h_len
+            var  = (self.cvd_sum_sq[sym] / h_len) - (mean * mean)
+            std  = max(0.0, var) ** 0.5
             self.cvd_z_cache[sym] = (val - mean) / std if std > 0.01 else 0.0
         else:
-            self.cvd_history[sym].append(val)
-            if state['n'] >= 10:
-                std = (state['M2'] / state['n']) ** 0.5
-                self.cvd_z_cache[sym] = (val - state['mean']) / std if std > 0.01 else 0.0
-            else: self.cvd_z_cache[sym] = 0.0
+            self.cvd_z_cache[sym] = 0.0
 
     def _update_oi_stats(self, sym, val, ts=None):
         if not sym: return
@@ -301,9 +300,11 @@ class MarketIntelligence:
             except: await asyncio.sleep(2)
 
     async def _throttled_oi_fetch(self, session, sym, headers):
-        elapsed = time.time() - self.last_oi_request_time
-        # Global throttle stays for base protection, but symbol-specific backoff is now primary
-        if elapsed < 0.02: await asyncio.sleep(0.02 - elapsed)
+        # [P1-3] Removed the per-call 20ms sleep. Two mechanisms already cap
+        # throughput without blocking the caller:
+        #   1. _run_oi_rest_pump sleeps 50ms per outer loop iteration (~20/s cap).
+        #   2. oi_semaphore(15) limits concurrent in-flight HTTP requests.
+        # The old sleep serialised the pump coroutine for no additional safety.
         asyncio.create_task(self._fetch_single_oi(session, sym, headers))
         self.last_oi_request_time = time.time()
 
